@@ -416,12 +416,13 @@ DLL_API signed char F_API FSOUND_StopSound(int channel)
     if (!check_channel(channel)) {
         return false;
     }
-    if (!global_instance.tracks[channel]->is_used)
+    Track* track = global_instance.tracks[channel].get();
+    if (!track->is_used)
         return false;
-    if (!MIX_StopTrack(global_instance.tracks[channel]->handle, FALSE)) {
+    if (!MIX_StopTrack(track->handle, FALSE)) {
         return false;
     }
-    clear_track(global_instance.tracks[channel].get());
+    clear_track(track);
 
     return true;
 }
