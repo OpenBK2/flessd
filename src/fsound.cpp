@@ -419,6 +419,8 @@ DLL_API signed char F_API FSOUND_StopSound(int channel)
     Track* track = global_instance.tracks[channel].get();
     if (!track->is_used)
         return false;
+    if(!MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr))
+        return false;
     if (!MIX_StopTrack(track->handle, FALSE)) {
         return false;
     }
