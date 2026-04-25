@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <mutex>
 
 #include "flessd/types.h"
 #include "flessd/music.h"
@@ -37,6 +38,11 @@ struct Track {
     // CRAP - this could've been a std::variant
     FSOUND_STREAM* stream = nullptr;
     Sample* sample = nullptr;
+
+    // Keep callback ownership on the track so SDL userdata never points into
+    // a stream object that might be freed while the track is being recycled.
+    FSOUND_STREAMCALLBACK stopped_callback = nullptr;
+    void* stopped_userdata = nullptr;
 };
 
 struct FSound
@@ -48,6 +54,8 @@ struct FSound
 };
 
 static FSound global_instance;
+
+static std::mutex callback_state_mutex;
 
 DLL_API signed char F_API FSOUND_SetDriver(int driver)
 {
@@ -121,6 +129,13 @@ DLL_API signed char F_API FSOUND_Init(int mixrate, int maxsoftwarechannels, unsi
 DLL_API void F_API FSOUND_Close()
 {
     if (global_instance.mixer) {
+        // Ensure SDL no longer owns callbacks that reference our state during
+        // shutdown.
+        for (const auto &track : global_instance.tracks) {
+            if (track && track->handle) {
+                MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
+            }
+        }
 
         MIX_DestroyMixer(global_instance.mixer);
         global_instance.mixer = nullptr;
@@ -162,17 +177,32 @@ DLL_API float F_API FSOUND_GetVersion()
 
 static void clear_track(Track* track)
 {
-    if (track->stream)
-    {
-        FSOUND_Stream_SetEndCallback(track->stream, 0, nullptr);
-        track->stream->track = nullptr;
+    if (!track) {
+        return;
     }
-    
+
+    // Always detach native callback first so SDL cannot call into stale
+    // userdata while we are tearing down or recreating the track.
+    if (track->handle) {
+        MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        track->stopped_callback = nullptr;
+        track->stopped_userdata = nullptr;
+        if (track->stream) {
+            track->stream->track = nullptr;
+        }
+        track->stream = nullptr;
+    }
+
     track->is_used = false;
-    track->stream = nullptr;
     track->sample = nullptr;
-    MIX_DestroyTrack(track->handle);
-    track->handle = MIX_CreateTrack(global_instance.mixer);
+    if (track->handle) {
+        MIX_DestroyTrack(track->handle);
+    }
+    track->handle = global_instance.mixer ? MIX_CreateTrack(global_instance.mixer) : nullptr;
 }
 
 static void refresh_track_usage()
@@ -182,6 +212,11 @@ static void refresh_track_usage()
             continue; // keep reserved channel 0 behavior
         }
         if (!track->is_used) {
+            continue;
+        }
+        if (!track->handle) {
+            track->is_used = false;
+            track->sample = nullptr;
             continue;
         }
 
@@ -202,6 +237,18 @@ static Track* find_track_by_stream(FSOUND_STREAM* stream)
     
     for (auto &track : global_instance.tracks)
         if (track->stream == stream)
+            return track.get();
+
+    return nullptr;
+}
+
+static Track* find_track_by_handle(MIX_Track* handle)
+{
+    if (!handle)
+        return nullptr;
+
+    for (auto &track : global_instance.tracks)
+        if (track->handle == handle)
             return track.get();
 
     return nullptr;
@@ -234,7 +281,9 @@ FSOUND_Sample_Load(int index, const char *name_or_data, unsigned int mode,
 
     SDL_IOStream* io = nullptr;
     if (load_from_memory) {
-        io = SDL_IOFromMem(const_cast<void*>(reinterpret_cast<const void*>(name_or_data)), length);
+        // Input buffer can be immutable; use const-memory IO to avoid casting
+        // away const and invoking undefined writes through the IO layer.
+        io = SDL_IOFromConstMem(reinterpret_cast<const void*>(name_or_data), length);
         if (!io) {
 			return nullptr;
         }
@@ -267,20 +316,27 @@ FSOUND_Sample_Load(int index, const char *name_or_data, unsigned int mode,
 DLL_API void F_API FSOUND_Sample_Free(FSOUND_SAMPLE *sptr)
 {
     if (sptr && global_instance.mixer) {
+        // Stop and detach every channel that still references this sample
+        // before destroying MIX_Audio. This avoids tracks reading freed audio.
+        for (int i = 0; i < global_instance.tracks.size(); i++) {
+            Track* track = global_instance.tracks[i].get();
+            if (track->sample == sptr) {
+                if (track->handle) {
+                    MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
+                    MIX_StopTrack(track->handle, FALSE);
+                }
+                clear_track(track);
+            }
+        }
+
         if (sptr->wave) {
 			MIX_DestroyAudio(sptr->wave);
 			sptr->wave = nullptr;
         }
 
-        for (int i = 0; i < global_instance.samples.size(); i++)
+        for (int i = 0; i < global_instance.samples.size(); i++) {
             if (global_instance.samples[i].get() == sptr) {
                 global_instance.samples.erase(global_instance.samples.begin() + i);
-                break;
-            }
-
-        for (int i = 0; i < global_instance.tracks.size(); i++) {
-            if (global_instance.tracks[i]->sample == sptr) {
-                clear_track(global_instance.tracks[i].get());
                 break;
             }
         }
@@ -346,6 +402,8 @@ DLL_API unsigned int F_API FSOUND_Sample_GetMode(FSOUND_SAMPLE *sptr)
     return sptr->mode;
 }
 
+static bool check_channel(int channel);
+
 DLL_API int F_API FSOUND_PlaySound(int channel, FSOUND_SAMPLE *sptr)
 {
     return FSOUND_PlaySoundEx(channel, sptr, NULL, FALSE);
@@ -357,51 +415,63 @@ DLL_API int F_API FSOUND_PlaySoundEx(int channel, FSOUND_SAMPLE *sptr, FSOUND_DS
         return -1;
 
     refresh_track_usage();
+    Track* selected_track = nullptr;
     if (channel == FSOUND_FREE) {
-        for (const auto & track: global_instance.tracks) {
-
+        for (const auto &track : global_instance.tracks) {
             if (track->channel == 0) {
                 // never return channel zero, keep it for internal use
                 continue;
             }
-
             if (!track->is_used) {
-
-                if (!MIX_SetTrackAudio(track->handle, sptr->wave)) {
-                    return -1;
-                }
-                track->sample = sptr;
-                track->is_used = true;
-
-                SDL_PropertiesID properties = SDL_CreateProperties();
-                if (!properties) {
-                    return -1;
-                }
-                if (!SDL_SetNumberProperty(properties, MIX_PROP_PLAY_LOOPS_NUMBER, sptr->loop ? -1 : 0)) {
-                    SDL_DestroyProperties(properties);
-                    return -1;
-                }
-
-                if (!MIX_PlayTrack(track->handle, properties)) {
-                    SDL_DestroyProperties(properties);
-                    return -1;
-                }
-
-                SDL_DestroyProperties(properties);
-
-                if (startpaused) {
-                    if (!MIX_PauseTrack(track->handle)) {
-                        return -1;
-                    }
-                }
-                return track->channel;
+                selected_track = track.get();
+                break;
             }
         }
     } else {
-        abort();
+        // Explicit channel requests should fail gracefully instead of aborting
+        // the process.
+        if (!check_channel(channel) || channel == 0) {
+            return -1;
+        }
+        selected_track = global_instance.tracks[channel].get();
+        if (selected_track->is_used) {
+            clear_track(selected_track);
+        }
     }
 
-    return -1;
+    if (!selected_track || !selected_track->handle) {
+        return -1;
+    }
+
+    if (!MIX_SetTrackAudio(selected_track->handle, sptr->wave)) {
+        return -1;
+    }
+    selected_track->sample = sptr;
+    selected_track->is_used = true;
+
+    SDL_PropertiesID properties = SDL_CreateProperties();
+    if (!properties) {
+        return -1;
+    }
+    if (!SDL_SetNumberProperty(properties, MIX_PROP_PLAY_LOOPS_NUMBER, sptr->loop ? -1 : 0)) {
+        SDL_DestroyProperties(properties);
+        return -1;
+    }
+
+    if (!MIX_PlayTrack(selected_track->handle, properties)) {
+        SDL_DestroyProperties(properties);
+        return -1;
+    }
+
+    SDL_DestroyProperties(properties);
+
+    if (startpaused) {
+        if (!MIX_PauseTrack(selected_track->handle)) {
+            return -1;
+        }
+    }
+
+    return selected_track->channel;
 }
 
 static bool check_channel(int channel) {
@@ -541,7 +611,9 @@ DLL_API FSOUND_STREAM * F_API FSOUND_Stream_Open(const char *name_or_data, unsig
     }
 	SDL_IOStream* io = nullptr;
     if (load_from_memory) {
-        io = SDL_IOFromMem(const_cast<void*>(reinterpret_cast<const void*>(name_or_data)), length);
+        // Input buffer can be immutable; use const-memory IO to avoid casting
+        // away const and invoking undefined writes through the IO layer.
+        io = SDL_IOFromConstMem(reinterpret_cast<const void*>(name_or_data), length);
         if (!io) {
             return nullptr;
         }
@@ -565,29 +637,36 @@ DLL_API FSOUND_STREAM * F_API FSOUND_Stream_Open(const char *name_or_data, unsig
 
 DLL_API signed char F_API FSOUND_Stream_Close(FSOUND_STREAM *stream)
 {
-    if (stream && global_instance.mixer) {
-        if (stream->wave) {
-            MIX_DestroyAudio(stream->wave);
-            stream->wave = nullptr;
-        }
-
-        for (int i = 0; i < global_instance.streams.size(); i++)
-        {
-            if (global_instance.streams[i].get() == stream)
-            {
-                global_instance.streams.erase(global_instance.streams.begin() + i);
-                break;
-            }
-        }
-
-        auto track = find_track_by_stream(stream);
-        if (!track)
-            return false;
-        
-        clear_track(track);
-
-        return true;
+    if (!stream || !global_instance.mixer) {
+        return false;
     }
+
+    // Detach every track bound to this stream before freeing the stream data.
+    // This prevents stale track->stream pointers and callback userdata.
+    for (const auto &track : global_instance.tracks) {
+        if (track->stream == stream) {
+            if (track->handle) {
+                MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
+                MIX_StopTrack(track->handle, FALSE);
+            }
+            clear_track(track.get());
+        }
+    }
+
+    if (stream->wave) {
+        MIX_DestroyAudio(stream->wave);
+        stream->wave = nullptr;
+    }
+
+    for (int i = 0; i < global_instance.streams.size(); i++)
+    {
+        if (global_instance.streams[i].get() == stream)
+        {
+            global_instance.streams.erase(global_instance.streams.begin() + i);
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -601,58 +680,84 @@ DLL_API int F_API FSOUND_Stream_PlayEx(int channel, FSOUND_STREAM *stream, FSOUN
     if(!stream || !stream->wave)
         return -1;
 
-    refresh_track_usage();
-    if (channel == FSOUND_FREE) {
-        for (const auto & track: global_instance.tracks) {
+    // A stream object tracks a single active channel in this wrapper.
+    // Rebinds first to avoid stale stream->track / track->stream pairings.
+    Track* existing_track = find_track_by_stream(stream);
+    if (existing_track) {
+        clear_track(existing_track);
+    }
 
+    refresh_track_usage();
+    Track* selected_track = nullptr;
+    if (channel == FSOUND_FREE) {
+        for (const auto &track : global_instance.tracks) {
             if (track->channel == 0) {
                 // never return channel zero, keep it for internal use
                 continue;
             }
             if (!track->is_used) {
-
-                if (!MIX_SetTrackAudio(track->handle, stream->wave)) {
-                    return -1;
-                }
-                track->is_used = true;
-                stream->track = track->handle;
-                track->stream = stream;
-                track->sample = nullptr;
-
-                if (!MIX_PlayTrack(track->handle, 0)) {
-                    return -1;
-                }
-
-                if (startpaused) {
-                    if (!MIX_PauseTrack(track->handle)) {
-                        return -1;
-                    }
-                }
-                return track->channel;
+                selected_track = track.get();
+                break;
             }
         }
     } else {
-        abort();
+        // Explicit channel requests should fail gracefully instead of aborting
+        // the process.
+        if (!check_channel(channel) || channel == 0) {
+            return -1;
+        }
+        selected_track = global_instance.tracks[channel].get();
+        if (selected_track->is_used) {
+            clear_track(selected_track);
+        }
     }
-    return -1;
+
+    if (!selected_track || !selected_track->handle) {
+        return -1;
+    }
+
+    if (!MIX_SetTrackAudio(selected_track->handle, stream->wave)) {
+        return -1;
+    }
+    selected_track->is_used = true;
+    selected_track->sample = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        selected_track->stream = stream;
+    }
+    stream->track = selected_track->handle;
+
+    if (!MIX_PlayTrack(selected_track->handle, 0)) {
+        return -1;
+    }
+
+    if (startpaused) {
+        if (!MIX_PauseTrack(selected_track->handle)) {
+            return -1;
+        }
+    }
+    return selected_track->channel;
 }
 
 DLL_API signed char F_API FSOUND_Stream_Stop(FSOUND_STREAM *stream)
 {
-    if (!stream || !stream->track) {
-        return -1;
-    }
-    if (!MIX_StopTrack(stream->track, false)) {
+    if (!stream) {
         return false;
     }
 
-    auto track = find_track_by_stream(stream);
-    if (!track)
-        return false;
-    
-    clear_track(track);
+    bool stopped = false;
+    for (const auto &track : global_instance.tracks) {
+        if (track->stream == stream) {
+            if (track->handle) {
+                MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
+                MIX_StopTrack(track->handle, false);
+            }
+            clear_track(track.get());
+            stopped = true;
+        }
+    }
 
-    return true;
+    return stopped ? TRUE : FALSE;
 }
 
 static Sint64 get_frame_size(FSOUND_STREAM * stream) {
@@ -741,11 +846,23 @@ DLL_API int F_API FSOUND_Stream_GetLengthMs(FSOUND_STREAM *stream)
 }
 
 void SDLCALL TrackStoppedCallback(void *userdata, MIX_Track *track) {
+    Track * callback_track = reinterpret_cast<Track *>(userdata);
+    if (!callback_track) {
+        return;
+    }
 
-    CallbackData * callback = reinterpret_cast<CallbackData *>(userdata);
+    FSOUND_STREAMCALLBACK callback = nullptr;
+    FSOUND_STREAM * stream = nullptr;
+    void * callback_userdata = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        callback = callback_track->stopped_callback;
+        stream = callback_track->stream;
+        callback_userdata = callback_track->stopped_userdata;
+    }
 
-    if (callback->inner_callback) {
-        callback->inner_callback(callback->stream, nullptr, 0, callback->userdata);
+    if (callback && stream) {
+        callback(stream, nullptr, 0, callback_userdata);
     }
 }
 
@@ -755,10 +872,34 @@ DLL_API signed char F_API FSOUND_Stream_SetEndCallback(FSOUND_STREAM *stream, FS
         return false;
     }
 
-	stream->callback_data.stream = stream;
-	stream->callback_data.inner_callback = callback;
-	stream->callback_data.userdata = userdata;
-    if (!MIX_SetTrackStoppedCallback(stream->track, TrackStoppedCallback, &stream->callback_data)) {
+    Track* owner_track = find_track_by_stream(stream);
+    if (!owner_track) {
+        owner_track = find_track_by_handle(stream->track);
+    }
+    if (!owner_track || !owner_track->handle) {
+        return false;
+    }
+
+    // Clearing callbacks now unregisters from SDL too, so no stale userdata is
+    // left behind on track recycle/close.
+    if (!callback) {
+        {
+            std::lock_guard<std::mutex> lock(callback_state_mutex);
+            owner_track->stopped_callback = nullptr;
+            owner_track->stopped_userdata = nullptr;
+        }
+        if (!MIX_SetTrackStoppedCallback(owner_track->handle, nullptr, nullptr)) {
+            return false;
+        }
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        owner_track->stopped_callback = callback;
+        owner_track->stopped_userdata = userdata;
+    }
+    if (!MIX_SetTrackStoppedCallback(owner_track->handle, TrackStoppedCallback, owner_track)) {
         return false;
     }
 
@@ -794,7 +935,7 @@ DLL_API signed char F_API FSOUND_Sample_SetLoopPoints(FSOUND_SAMPLE *sptr, int l
 
 DLL_API FSOUND_SAMPLE * F_API FSOUND_GetCurrentSample(int channel)
 {
-    if (channel < 0 || channel > global_instance.tracks.size())
+    if (channel < 0 || channel >= global_instance.tracks.size())
         return nullptr;
 
     return global_instance.tracks[channel]->sample;
