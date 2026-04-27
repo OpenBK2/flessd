@@ -55,7 +55,10 @@ struct FSound
 
 static FSound global_instance;
 
-static std::mutex callback_state_mutex;
+// Callback paths can re-enter FSOUND APIs from SDL's audio thread.
+// Use a recursive mutex so re-entrant calls from the same thread do not deadlock,
+// while still serializing stream/track ownership transitions.
+static std::recursive_mutex callback_state_mutex;
 
 DLL_API signed char F_API FSOUND_SetDriver(int driver)
 {
@@ -188,21 +191,27 @@ static void clear_track(Track* track)
     }
 
     {
-        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
         track->stopped_callback = nullptr;
         track->stopped_userdata = nullptr;
+        track->is_used = false;
+        track->sample = nullptr;
         if (track->stream) {
             track->stream->track = nullptr;
         }
         track->stream = nullptr;
     }
 
-    track->is_used = false;
-    track->sample = nullptr;
     if (track->handle) {
-        MIX_DestroyTrack(track->handle);
+        // Do not destroy/recreate tracks here: stream end callbacks can re-enter
+        // FSOUND_Stream_PlayEx from SDL's mixer thread, and MIX_DestroyTrack()
+        // in that context is documented as undefined behavior if the track is
+        // then touched again in the same mixer iteration.
+        //
+        // Reusing the same track handle is enough to reset it for the next
+        // playback and avoids lifetime races in SDL's internal audio stream.
+        MIX_SetTrackAudio(track->handle, nullptr);
     }
-    track->handle = global_instance.mixer ? MIX_CreateTrack(global_instance.mixer) : nullptr;
 }
 
 static void refresh_track_usage()
@@ -234,6 +243,10 @@ static Track* find_track_by_stream(FSOUND_STREAM* stream)
 {
     if (!stream)
         return nullptr;
+
+    // Stream ownership can change from end-callback re-entrancy.
+    // Read it under the same mutex used by clear/play/set-callback paths.
+    std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
     
     for (auto &track : global_instance.tracks)
         if (track->stream == stream)
@@ -644,7 +657,12 @@ DLL_API signed char F_API FSOUND_Stream_Close(FSOUND_STREAM *stream)
     // Detach every track bound to this stream before freeing the stream data.
     // This prevents stale track->stream pointers and callback userdata.
     for (const auto &track : global_instance.tracks) {
-        if (track->stream == stream) {
+        bool owns_stream = false;
+        {
+            std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+            owns_stream = (track->stream == stream);
+        }
+        if (owns_stream) {
             if (track->handle) {
                 MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
                 MIX_StopTrack(track->handle, FALSE);
@@ -722,10 +740,10 @@ DLL_API int F_API FSOUND_Stream_PlayEx(int channel, FSOUND_STREAM *stream, FSOUN
     selected_track->is_used = true;
     selected_track->sample = nullptr;
     {
-        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
         selected_track->stream = stream;
+        stream->track = selected_track->handle;
     }
-    stream->track = selected_track->handle;
 
     if (!MIX_PlayTrack(selected_track->handle, 0)) {
         return -1;
@@ -747,7 +765,12 @@ DLL_API signed char F_API FSOUND_Stream_Stop(FSOUND_STREAM *stream)
 
     bool stopped = false;
     for (const auto &track : global_instance.tracks) {
-        if (track->stream == stream) {
+        bool owns_stream = false;
+        {
+            std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+            owns_stream = (track->stream == stream);
+        }
+        if (owns_stream) {
             if (track->handle) {
                 MIX_SetTrackStoppedCallback(track->handle, nullptr, nullptr);
                 MIX_StopTrack(track->handle, false);
@@ -772,7 +795,16 @@ static Sint64 get_frame_size(FSOUND_STREAM * stream) {
 DLL_API signed char F_API FSOUND_Stream_SetPosition(FSOUND_STREAM *stream, unsigned int position)
 {
     // in BYTES (SDL takes frames)
-    if (!stream || !stream->track) {
+    MIX_Track *track = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+        if (!stream || !stream->track) {
+            return false;
+        }
+        track = stream->track;
+    }
+
+    if (!track) {
         return false;
     }
 
@@ -782,7 +814,7 @@ DLL_API signed char F_API FSOUND_Stream_SetPosition(FSOUND_STREAM *stream, unsig
     }
 
     Sint64 position_frames = position / frame_size;
-    if (!MIX_SetTrackPlaybackPosition(stream->track, position_frames)) {
+    if (!MIX_SetTrackPlaybackPosition(track, position_frames)) {
         return false;
     }
 
@@ -792,11 +824,20 @@ DLL_API signed char F_API FSOUND_Stream_SetPosition(FSOUND_STREAM *stream, unsig
 DLL_API unsigned int F_API FSOUND_Stream_GetPosition(FSOUND_STREAM *stream)
 {
     // in BYTES (SDL takes frames)
-    if (!stream || !stream->track) {
+    MIX_Track *track = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+        if (!stream || !stream->track) {
+            return 0;
+        }
+        track = stream->track;
+    }
+
+    if (!track) {
         return 0;
     }
 
-    Sint64 position_frames = MIX_GetTrackPlaybackPosition(stream->track);
+    Sint64 position_frames = MIX_GetTrackPlaybackPosition(track);
 
     return position_frames * get_frame_size(stream);
 }
@@ -804,12 +845,21 @@ DLL_API unsigned int F_API FSOUND_Stream_GetPosition(FSOUND_STREAM *stream)
 DLL_API signed char F_API FSOUND_Stream_SetTime(FSOUND_STREAM *stream, int ms)
 {
     // in MILLISECONDS (SDL takes frames)
-    if (!stream || !stream->track) {
+    MIX_Track *track = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+        if (!stream || !stream->track) {
+            return false;
+        }
+        track = stream->track;
+    }
+
+    if (!track) {
         return false;
     }
 
     Sint64 position_ms = MIX_AudioMSToFrames(stream->wave, ms);
-    MIX_SetTrackPlaybackPosition(stream->track, position_ms);
+    MIX_SetTrackPlaybackPosition(track, position_ms);
 
     return true;
 }
@@ -817,8 +867,16 @@ DLL_API signed char F_API FSOUND_Stream_SetTime(FSOUND_STREAM *stream, int ms)
 DLL_API int F_API FSOUND_Stream_GetTime(FSOUND_STREAM *stream)
 {
     // in MILLISECONDS (SDL takes frames)
-    if (stream && stream->track) {
-        Sint64 position = MIX_GetTrackPlaybackPosition(stream->track);
+    MIX_Track *track = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+        if (stream && stream->track) {
+            track = stream->track;
+        }
+    }
+
+    if (stream && track) {
+        Sint64 position = MIX_GetTrackPlaybackPosition(track);
         return MIX_AudioFramesToMS(stream->wave, position);
     }
     return 0;
@@ -851,30 +909,38 @@ void SDLCALL TrackStoppedCallback(void *userdata, MIX_Track *track) {
         return;
     }
 
-    FSOUND_STREAMCALLBACK callback = nullptr;
-    FSOUND_STREAM * stream = nullptr;
-    void * callback_userdata = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(callback_state_mutex);
-        callback = callback_track->stopped_callback;
-        stream = callback_track->stream;
-        callback_userdata = callback_track->stopped_userdata;
-    }
-
-    if (callback && stream) {
-        callback(stream, nullptr, 0, callback_userdata);
+    // Keep callback state locked for the entire callback invocation.
+    // This prevents FSOUND_Stream_Close/clear from freeing or rebinding the
+    // stream while user code is still running with the stream pointer.
+    std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+    if (callback_track->stopped_callback && callback_track->stream) {
+        callback_track->stopped_callback(
+            callback_track->stream,
+            nullptr,
+            0,
+            callback_track->stopped_userdata
+        );
     }
 }
 
 DLL_API signed char F_API FSOUND_Stream_SetEndCallback(FSOUND_STREAM *stream, FSOUND_STREAMCALLBACK callback, void *userdata)
 {
-    if (!stream || !stream->track) {
+    MIX_Track *stream_track = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
+        if (!stream || !stream->track) {
+            return false;
+        }
+        stream_track = stream->track;
+    }
+
+    if (!stream_track) {
         return false;
     }
 
     Track* owner_track = find_track_by_stream(stream);
     if (!owner_track) {
-        owner_track = find_track_by_handle(stream->track);
+        owner_track = find_track_by_handle(stream_track);
     }
     if (!owner_track || !owner_track->handle) {
         return false;
@@ -884,7 +950,7 @@ DLL_API signed char F_API FSOUND_Stream_SetEndCallback(FSOUND_STREAM *stream, FS
     // left behind on track recycle/close.
     if (!callback) {
         {
-            std::lock_guard<std::mutex> lock(callback_state_mutex);
+            std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
             owner_track->stopped_callback = nullptr;
             owner_track->stopped_userdata = nullptr;
         }
@@ -895,7 +961,7 @@ DLL_API signed char F_API FSOUND_Stream_SetEndCallback(FSOUND_STREAM *stream, FS
     }
 
     {
-        std::lock_guard<std::mutex> lock(callback_state_mutex);
+        std::lock_guard<std::recursive_mutex> lock(callback_state_mutex);
         owner_track->stopped_callback = callback;
         owner_track->stopped_userdata = userdata;
     }
